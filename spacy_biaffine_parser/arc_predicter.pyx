@@ -13,7 +13,7 @@ from spacy.training import Example, validate_get_examples, validate_examples
 from spacy.util import minibatch
 import srsly
 from thinc.api import Config, Model, Ops, Optimizer
-from thinc.api import to_numpy
+from thinc.api import SequenceCategoricalCrossentropy, to_numpy
 from thinc.types import Floats2d, Ints1d, Tuple
 
 from .eval import parser_score
@@ -71,6 +71,51 @@ class ArcPredicter(TrainablePipe):
         cfg = {"labels": [], "overwrite": overwrite}
         self.cfg = dict(sorted(cfg.items()))
         self.scorer = scorer
+
+    def distill(self,
+               teacher_pipe: "TrainablePipe",
+               teacher_examples: Iterable["Example"],
+               student_examples: Iterable["Example"],
+               *,
+               drop: float=0.0,
+               sgd: Optimizer=None,
+               losses: Optional[Dict[str, float]]=None) -> Dict[str, float]:
+        if losses is None:
+            losses = {}
+        if not hasattr(self, "model") or self.model in (None, True, False):
+            return losses
+        losses.setdefault(self.name, 0.0)
+
+        validate_examples(teacher_examples, "TrainablePipe.distill")
+        validate_examples(student_examples, "TrainablePipe.distill")
+
+        if not any(len(eg.predicted) if eg.predicted else 0 for eg in teacher_examples):
+            return losses
+        if not any(len(eg.predicted) if eg.predicted else 0 for eg in student_examples):
+            return losses
+
+        teacher_docs = [eg.predicted for eg in teacher_examples]
+        teacher_lens = sents2lens(teacher_docs, ops=teacher_pipe.model.ops)
+        teacher_scores = teacher_pipe.model.predict((teacher_docs, teacher_lens))
+
+        student_docs = [eg.predicted for eg in student_examples]
+        student_lens = sents2lens(student_docs, ops=self.model.ops)
+        student_scores, bp_student_scores = self.model.begin_update((student_docs, student_lens))
+
+        loss, d_scores = self.get_distill_loss(teacher_scores, student_scores)
+        bp_student_scores(d_scores)
+
+        if sgd not in (None, False):
+            self.finish_update(sgd)
+        losses[self.name] += loss
+        return losses
+
+    def get_distill_loss(self, teacher_scores, student_scores) -> Tuple[float, float]:
+        loss_func = SequenceCategoricalCrossentropy(normalize=False)
+        d_scores, loss = loss_func(student_scores, teacher_scores)
+        if self.model.ops.xp.isnan(loss):
+             raise ValueError(Errors.E910.format(name=self.name))
+        return float(loss), d_scores
 
     def get_loss(self, examples: Iterable[Example], scores) -> Tuple[float, Floats2d]:
         validate_examples(examples, "ArcPredicter.get_loss")
